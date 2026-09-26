@@ -1,2 +1,14 @@
 .DS_Store
 dataset/
+
+# Large artifacts excluded from the repo (regenerable from the pipeline)
+something_submission.zip
+submission/output/candidate_pairs.tsv
+submission/output/matching_results.tsv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
