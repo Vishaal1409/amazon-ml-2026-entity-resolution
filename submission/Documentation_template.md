@@ -13,7 +13,8 @@ selective yet noise-robust; (2) a LightGBM candidate filter on vectorised featur
 the candidate set to **3.84 records per Source-1 entity** (true average is 3.46) while keeping
 99.5% of reachable matches; (3) a LightGBM matcher on rich string-similarity and "competition"
 features, followed by one-to-one assignment and an F0.5-optimised threshold.
-Hold-out validation (662,834 unseen S1 entities): **macro F0.5 = 0.9750, precision 0.9954, recall 0.9394**.
+A second, *collective* pass uses each entity's confident matches as extra queries to recover records the S1 record alone cannot reach.
+Hold-out validation (265,078 S1 entities unseen by every model): **macro F0.5 = 0.9819, precision 0.9968, recall 0.9562**.
 
 ---
 
@@ -49,7 +50,9 @@ Normalisation (`normalize.py`, language-agnostic):
 - Unicode NFKC + accent folding, homoglyph repair in mixed alpha-numeric tokens, merging of dotted
   initials (`E.U.R.L.`→`eurl`), canonical legal forms (Pvt→private, Ltd→limited, SARL, SAS, …),
   split into *core* tokens vs legal/filler tokens.
-- Word segmentation of glued tokens with a unigram vocabulary built from S1 names (DP min-cost).
+- Word segmentation of glued tokens with a unigram vocabulary built from S1 names (DP min-cost);
+  only clean splits (≤4 pieces, each ≥3 letters) are accepted and transliterated text is never
+  segmented (error analysis showed segmentation was fragmenting transliterations such as `elaelapi`).
 - Address: US/Indian state names→codes, abbreviation canonicalisation (street→st, rue→r, …),
   number extraction with leading-zero stripping, a few Indian city aliases.
 
@@ -80,6 +83,21 @@ Normalisation (`normalize.py`, language-agnostic):
 
 ---
 
+- **Name-evidence probing (final version):** the rarest 5 name keys are always probed, 10 candidate
+  slots per S1 are reserved for the best name-only probe score, and name-token-pair compound keys are
+  added. Before this, records with long addresses spent their whole probe budget on address keys, so
+  candidates with an empty address were unreachable (recall on them 57% → 75%; overall blocking
+  recall 96.4% → 97.2% at the same pairs per S1; perfect-matcher bound 0.988 → 0.991).
+
+### 3.1 Pass 2 — collective candidate expansion
+Error analysis on the hold-out showed 4.4% of true pairs were lost at blocking and that 95% of those
+belong to an S1 entity that already had at least one confident match. Every S2/S3 record belongs to a
+single entity, so a confident match (pass-1 p ≥ 0.9, one-to-one) is another view of the same business
+with its own name/address variant. Each confident match is used as an additional query against the same
+blocking index; for each S1 the top-2 newly found records with sibling cosine ≥ 0.5 are added.
+The final `candidate_pairs.tsv` is this pass-2 universe (pass-1 candidates ∪ sibling-found records),
+i.e. exactly the set scored by the final model: **4.72 candidates per S1**, candidate recall 96.4%.
+
 ## 4. Matching Model
 
 **Features used (88):**
@@ -98,19 +116,50 @@ Normalisation (`normalize.py`, language-agnostic):
 stage-2 survivors of a disjoint fold of S1 entities (no leakage between stages).
 **Decision rule:** each S2/S3 record is assigned only to its highest-scoring S1 (one-to-one),
 then kept if p ≥ τ.
-**Threshold selection method:** τ = 0.70 chosen by maximising macro F0.5 (singletons included)
-on the hold-out fold.
+**Threshold selection method:** τ chosen by maximising macro F0.5 (singletons included) on hold-out data.
+
+**Pass-2 model:** LightGBM over pass-1 probabilities (missing for new pairs), rich similarity to the S1
+record, rich similarity to the best sibling that found the record, sibling-probe scores and hit counts,
+number of confident matches of the S1 (overall and in the same source), and competition features
+(is the record a confident match of another S1, best pass-1 probability of the record elsewhere).
+Pass-2 is trained on 60% of fold C (whose pass-1 scores are out-of-sample) and validated on the other 40%.
+Final decision: one-to-one assignment, threshold 0.70.
 
 Data split: S1 entities hashed into 10 folds — A (20%) trains the filter, B (50%) trains the
 matcher, C (30%) is the untouched validation set for the whole cascade.
 
 ---
 
+### 4.1 Generalisation to France (unseen country)
+Leaderboard analysis (US 0.982 / India 0.972 on validation vs 0.966 overall) implied France ≈ 0.90.
+Inspecting uncertain French test pairs showed distractors on the *same street* with nearby house
+numbers whose names differ by a single generic word ("CV Amis SARL" vs "CV Sportive SARL"), acronym
+aliases ("Calais Garage SAS" vs "CG"), and region/department names diluting address similarity.
+Country-agnostic features added: IDF-weighted cost of name words unmatched on either side, acronym
+match, house-number distance, street-level address similarity after removing each country's 400 most
+frequent address words (learned from the unlabelled files), extended legal forms (EI, EIRL, SCM, GIE…).
+Effect: validation +0.002; French predicted matches/S1 3.43 → 3.17 and uncertain French pairs 4.9% → 2.5%.
+Finally the pass-2 model is adapted to unseen countries by self-training: confident French test
+pairs (p ≥ 0.97 positives, ≤ 0.03 negatives, entities with any uncertain pair excluded; 721k rows)
+are added with weight 0.5; the adapted model is accepted only if US/India hold-out F0.5 does not drop
+(0.97999 → 0.97999). It changed 2.7% of French rows (uncertain share 2.5% → 1.9%).
+
 ## 5. Results & Error Analysis
 
-- **F0.5 Score (macro, hold-out 662,834 S1):** **0.9750** (precision 0.9954, recall 0.9394)
-- Candidate stage on hold-out: 3.84 candidates / S1, recall ceiling 95.6%.
-- Test run: 1,732,544 S1 entities; 7,564,527 candidate pairs (4.37 per S1); 5,732,646 predicted matches (3.31 per S1); 103,232 predicted singletons (6.0%). Validator: PASS.
+| Stage (hold-out) | F0.5 | Precision | Recall | Cands/S1 |
+|---|---|---|---|---|
+| Pass 1 (initial) | 0.9750 | 0.9954 | 0.9394 | 3.84 |
+| Pass 1 + segmentation fix | 0.9761 | 0.9958 | 0.9414 | 3.83 |
+| Pass 2 collective | 0.9781 | 0.9961 | 0.9485 | 4.72 |
+| + France-oriented generic features | 0.9800 | 0.9972 | 0.9518 | 4.72 |
+| **+ name-evidence blocking (final)** | **0.9819** | **0.9968** | **0.9562** | **~5** |
+
+- Upper bound with a perfect matcher on the final candidate set ≈ 0.988: the remaining gap is
+  dominated by blocking losses.
+- Loss breakdown (share of all true pairs, pass 1): empty address + generic name 1.9% (practically
+  unresolvable), empty address with unique name 0.7%, completely different trade name 0.75%,
+  Indic-script records 0.8%, other noise 1.4%.
+- Test run (final): 1,732,544 S1 entities; 9,728,804 candidate pairs (5.62 per S1); 5,711,907 predicted matches (3.30 per S1). Validator (with --check-ids): PASS.
 - **Common false positives:** same generic name ("Global Technologies Pvt Ltd") where the
   candidate address is truncated to "door no + city" and matches another entity in that city.
 - **Common false negatives:** candidate records with empty address and generic names; DBA /
@@ -122,5 +171,5 @@ matcher, C (30%) is the untouched validation set for the whole cascade.
 Careful normalisation (transliteration learned from data, segmentation, homoglyphs) plus
 compound-key blocking gives a high-recall, linearly scalable candidate generator; a learned filter
 shrinks candidates to near the true-match count, and a context-aware GBDT with one-to-one
-assignment yields 0.975 macro F0.5 on unseen entities. All models are LightGBM (MIT licence),
+assignment yields 0.982 macro F0.5 on unseen entities. All models are LightGBM (MIT licence),
 far below the 8B parameter limit; no external data or services are used.

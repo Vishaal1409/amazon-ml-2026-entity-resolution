@@ -181,6 +181,7 @@ NAME_CANON = {
     "mgmt": "management", "tech": "technologies", "technology": "technologies",
     "dev": "development", "grp": "group", "ctr": "center", "centre": "center",
     "&": "and", "et": "and", "l.l.c": "llc", "st": "saint", "ste": "saint", "sainte": "saint",
+    "elaelapi": "llp", "elelpi": "llp", "elalpi": "llp",
     "ets": "etablissements", "cie": "compagnie", "ste.": "societe", "soc": "societe",
 }
 # tokens that carry legal form / honorifics / filler rather than identity
@@ -234,7 +235,8 @@ def _maybe_segment(toks):
     for t in toks:
         if len(t) >= 7 and t.isalpha() and t not in VOCAB:
             seg = segment(t)
-            if seg:
+            # only trust clean splits: short fragments are usually typos or transliteration debris
+            if seg and len(seg) <= 4 and all(len(w) >= 3 for w in seg):
                 out.extend(seg)
                 continue
         out.append(t)
@@ -242,6 +244,7 @@ def _maybe_segment(toks):
 
 
 def name_tokens(raw):
+    indic = has_indic(raw)
     s = fold(raw)
     m = _DOMAIN.search(s.strip())
     if m:
@@ -253,7 +256,9 @@ def name_tokens(raw):
     alias_toks = []
     for i, p in enumerate(parts):
         toks = [fix_homoglyphs(t) for t in _NON_ALNUM.sub(" ", p).split()]
-        toks = _maybe_segment(merge_initials(toks))
+        toks = merge_initials(toks)
+        if not indic:
+            toks = _maybe_segment(toks)
         exp = []
         for t in toks:
             c = NAME_CANON.get(t)

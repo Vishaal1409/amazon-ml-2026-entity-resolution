@@ -36,6 +36,10 @@ K_FINAL = 10
 REL_MIN = 0.3
 MUTUAL_R = 2
 TOP_NAME, TOP_ADDR, TOP_NUM = 3, 4, 3
+NAME_PROBE = 5        # rarest name keys always probed
+NAME_DF_MAX = 2000
+NAME_KT = ["n", "c", "k", "m"]   # key types carrying name evidence (m = name-token pair)
+K_NAME = 10           # extra candidates per S1 reserved for the best name-only matches
 
 ADDR_STOP = ["st", "rd", "ave", "dr", "blvd", "ln", "ct", "pl", "unit", "no", "the", "and", "of",
              "de", "du", "des", "la", "le", "nr", "opp", "flr", "floor", "road", "near", "box",
@@ -87,7 +91,13 @@ def compound_keys(sk):
     for a, b, salt in ((nt, aw, 1), (hn, aw, 2), (nt, hn, 3)):
         x, y = a.columns[1], b.columns[1]
         parts.append(a.join(b, on="eid").select(
-            "eid", pl.struct(pl.col(x), pl.col(y), pl.lit(salt)).hash(seed=11).alias("key")))
+            "eid", pl.struct(pl.col(x), pl.col(y), pl.lit(salt)).hash(seed=11).alias("key"),
+            pl.lit("x").alias("kt")))
+    # name-token pairs (order-free): individually common words, rare together
+    n4 = top("n", TOP_NAME + 1)
+    nn = n4.join(n4.rename({"n": "n2"}), on="eid").filter(pl.col("n") < pl.col("n2"))
+    parts.append(nn.select("eid", pl.struct("n", "n2", pl.lit(4)).hash(seed=11).alias("key"),
+                           pl.lit("m").alias("kt")))
     return pl.concat(parts).unique(["eid", "key"])
 
 
@@ -110,12 +120,22 @@ def build_shard(s1, cand):
     return dict(k1=k1, kc=kc.rename({"eid": "cid"}), c1=c1, cc=cc.rename({"eid": "cid"}))
 
 
-def score_shard(ix, df_max=DF_MAX, m_probe=M_PROBE, k_probe=K_PROBE, chunk=100_000):
+def score_shard(ix, df_max=DF_MAX, m_probe=M_PROBE, k_probe=K_PROBE, chunk=100_000,
+                name_probe=NAME_PROBE, name_df_max=NAME_DF_MAX, k_name=K_NAME):
     k1, kc, c1, cc = ix["k1"], ix["kc"], ix["c1"], ix["cc"]
-    probe_src = pl.concat([k1.select("eid", "key", "df", "w"), c1.select("eid", "key", "df", "w")])
+    probe_src = pl.concat([k1.select("eid", "key", "df", "w", "kt"), c1.select("eid", "key", "df", "w", "kt")])
     probe = (probe_src.filter((pl.col("df") >= 1) & (pl.col("df") <= df_max))
                       .sort(["eid", "df"]).group_by("eid", maintain_order=True).head(m_probe)
-                      .select("eid", "key"))
+                      .select("eid", "key", "kt"))
+    if name_probe:
+        # always probe the rarest *name* keys too: otherwise records with long addresses spend
+        # the whole probe budget on address keys and candidates without an address are unreachable
+        namek = (probe_src.filter(pl.col("kt").is_in(NAME_KT) & (pl.col("df") >= 1)
+                           & (pl.col("df") <= name_df_max))
+                   .sort(["eid", "df"]).group_by("eid", maintain_order=True).head(name_probe)
+                   .select("eid", "key", "kt"))
+        probe = pl.concat([probe, namek]).unique(["eid", "key"])
+        df_max = max(df_max, name_df_max)
     idx = pl.concat([kc.filter(pl.col("df") <= df_max).select("cid", "key", "w"),
                      cc.filter(pl.col("df") <= df_max).select("cid", "key", "w")])
     norm1 = k1.group_by("eid").agg(pl.col("w").pow(2).sum().sqrt().alias("n1"))
@@ -127,8 +147,13 @@ def score_shard(ix, df_max=DF_MAX, m_probe=M_PROBE, k_probe=K_PROBE, chunk=100_0
         lo, hi = ids[i], ids[min(i + chunk, len(ids)) - 1]
         rng = pl.col("eid").is_between(lo, hi)
         pairs = (probe.filter(rng).join(idx, on="key")
-                      .group_by("eid", "cid").agg(pl.col("w").sum().alias("ps"))
-                      .filter(pl.col("ps").rank("ordinal", descending=True).over("eid") <= k_probe))
+                      .group_by("eid", "cid").agg(pl.col("w").sum().alias("ps"),
+                                                 pl.col("w").filter(pl.col("kt").is_in(NAME_KT)).sum().alias("psn"))
+                      # top by overall probe score, plus reserved slots for the best name-only
+                      # evidence (records with missing/garbled addresses cannot win on the sum)
+                      .filter((pl.col("ps").rank("ordinal", descending=True).over("eid") <= k_probe)
+                              | ((pl.col("psn") > 0)
+                                 & (pl.col("psn").rank("ordinal", descending=True).over("eid") <= k_name))))
         mine = k1.filter(rng).select("eid", "key", "w", "kt")
         shared = (pairs.select("eid", "cid").join(mine, on="eid").join(kc_all, on=["cid", "key"])
                        .group_by("eid", "cid").agg(

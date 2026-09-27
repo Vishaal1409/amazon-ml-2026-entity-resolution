@@ -15,7 +15,7 @@ from rapidfuzz.distance import JaroWinkler, Levenshtein
 from common import WORK, N_JOBS
 from normalize import skeleton
 
-REC_COLS = ["n_norm", "n_core", "n_legal", "a_norm", "a_words", "a_nums", "indic"]
+REC_COLS = ["n_norm", "n_core", "n_legal", "a_norm", "a_words", "a_nums", "indic", "country"]
 
 STR_FEATS = [
     "nm_ratio", "nm_tsort", "nm_tset", "nm_partial", "core_ratio", "core_tsort", "core_tset",
@@ -26,7 +26,57 @@ STR_FEATS = [
     "ad_ratio", "ad_tset", "ad_tsort", "ad_partial", "adw_tset", "adw_jacc", "adw_ovl",
     "num_jacc", "num_ovl", "num_any", "hn_eq", "zip_eq", "zip_conflict", "n_nums1", "n_nums2",
     "addr_empty2", "addr_len1", "addr_len2", "indic2",
+    # v3: features aimed at dense, generic-vocabulary data (France)
+    "uniq_idf1", "uniq_idf2", "uniq_idf_max", "acro_12", "acro_21", "hn_absdiff", "hn_near",
+    "street_tset", "street_jacc", "legal_ext_conflict",
 ]
+
+# per-worker lookup tables (see aux_tables.py / learn_dict.py)
+_COST = {}          # name token -> -log p (from Source-1 names)
+_COST_MAX = 20.0
+_COMMON = {}        # country -> set of very frequent address words
+LEGAL_EXT = {"ei", "eirl", "scm", "gie", "sel", "selas", "sca"}
+
+
+def init_tables():
+    import json
+    global _COST_MAX
+    try:
+        _COST.update(json.load(open(WORK / "name_vocab.json")))
+        _COST_MAX = max(_COST.values()) if _COST else 20.0
+    except FileNotFoundError:
+        pass
+    try:
+        _COMMON.update({c: set(v) for c, v in json.load(open(WORK / "addr_common.json")).items()})
+    except FileNotFoundError:
+        pass
+
+
+def _unmatched_cost(a, b):
+    """cost (-log p) of tokens in a with no JW>=0.9 counterpart in b: (sum, max)"""
+    tot, mx = 0.0, 0.0
+    for t in a:
+        if any(t == u or JaroWinkler.similarity(t, u) >= 0.9 for u in b):
+            continue
+        c = _COST.get(t, _COST_MAX)
+        tot += c
+        mx = max(mx, c)
+    return tot, mx
+
+
+def _acronym(a, b):
+    """initials of a's tokens (>=2) equal a token of b or b's concatenation"""
+    if len(a) < 2 or not b:
+        return 0.0
+    ini = "".join(t[0] for t in a)
+    return float(ini in b or ini == "".join(b))
+
+
+def _first_num(nums):
+    for n in nums:
+        if n.isdigit():
+            return int(n)
+    return None
 
 
 def _set_stats(a, b):
@@ -54,8 +104,8 @@ def _zips(nums):
 
 
 def pair_feats(r1, r2):
-    n1, c1, l1, a1, aw1, an1, _ = r1
-    n2, c2, l2, a2, aw2, an2, ind2 = r2
+    n1, c1, l1, a1, aw1, an1, _, ctry = r1
+    n2, c2, l2, a2, aw2, an2, ind2, _ = r2
     t1, t2 = c1.split(), c2.split()
     s1, s2 = set(t1), set(t2)
     k1 = {skeleton(t) for t in t1}
@@ -91,6 +141,22 @@ def pair_feats(r1, r2):
         len(nums1), len(nums2),
         float(a2 == ""), len(a1), len(a2), float(ind2),
     ]
+    u1, m1 = _unmatched_cost(t1, t2)
+    u2, m2 = _unmatched_cost(t2, t1)
+    h1, h2 = _first_num(nums1), _first_num(nums2)
+    hd = abs(h1 - h2) if h1 is not None and h2 is not None else -1
+    common = _COMMON.get(ctry, set())
+    sw1 = [w for w in aw1.split() if w not in common]
+    sw2 = [w for w in aw2.split() if w not in common]
+    le1 = {t for t in n1.split() if t in LEGAL_EXT} | lg1
+    le2 = {t for t in n2.split() if t in LEGAL_EXT} | lg2
+    out += [
+        u1, u2, max(m1, m2), _acronym(t2, t1), _acronym(t1, t2),
+        float(np.log1p(hd)) if hd >= 0 else -1.0, float(0 < hd <= 10),
+        fuzz.token_set_ratio(" ".join(sw1), " ".join(sw2)) if sw1 and sw2 else -1.0,
+        _set_stats(set(sw1), set(sw2))[0] if sw1 and sw2 else -1.0,
+        float(bool(le1) and bool(le2) and not (le1 & le2)),
+    ]
     return out
 
 
@@ -108,7 +174,7 @@ def compute(pairs, s1, cand, chunk=20000):
     left = list(zip(*[d[c].to_list() for c in REC_COLS]))
     right = list(zip(*[d[c + "_2"].to_list() for c in REC_COLS]))
     jobs = [(left[i:i + chunk], right[i:i + chunk]) for i in range(0, len(left), chunk)]
-    with Pool(N_JOBS) as pool:
+    with Pool(N_JOBS, initializer=init_tables) as pool:
         mats = pool.map(_work, jobs)
     X = np.vstack(mats) if mats else np.zeros((0, len(STR_FEATS)), np.float32)
     feats = pl.DataFrame(X, schema=[f"r_{c}" for c in STR_FEATS])

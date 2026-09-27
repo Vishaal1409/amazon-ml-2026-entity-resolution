@@ -5,6 +5,8 @@ dataset/
 something_submission.zip
 submission/output/candidate_pairs.tsv
 submission/output/matching_results.tsv
+something_submission/output/candidate_pairs.tsv
+something_submission 2/output/candidate_pairs.tsv
 
 # Python
 __pycache__/

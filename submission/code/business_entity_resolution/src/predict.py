@@ -29,6 +29,8 @@ def main(split="test"):
     del sc
     feats = P.stage3_frame(split, surv)
     feats = feats.with_columns(pl.Series("p3", m3.predict(feats.select(P.stage3_cols()).to_numpy(), num_threads=N_JOBS)))
+    feats.select("eid", "cid", "p2", "p3").write_parquet(WORK / f"{split}_pass1.parquet")
+    surv.select("eid", "cid").write_parquet(WORK / f"{split}_surv.parquet")
     pred = P.decide(feats, "p3", cfg["thr3"])
 
     s1 = load(split, 1).select("eid", "entity_id")
